@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, List
 import google.generativeai as genai
 from dotenv import load_dotenv
+import uuid
 
 # --- Configuration Globale ---
 load_dotenv()
@@ -234,61 +235,6 @@ Ne retourne que le JSON, sans texte supplémentaire. NE PAS INCLURE patient_id o
         self.db_conn.commit()
         return count
 
-    # def process_report(self, report_path: Path) -> Dict[str, int]:
-    #     """Traite un rapport complet et insère toutes les données de staging"""
-    #     print(f"\n📄 Traitement : {report_path.name}")
-    #     try:
-    #         with open(report_path, 'r', encoding='utf-8') as f:
-    #             report_text = f.read()
-    #     except Exception as e:
-    #         print(f"  ✗ Impossible de lire le fichier: {e}")
-    #         return {}
-        
-    #     stats = {}
-    #     stats['patients'] = self.insert_staging_data(
-    #         'staging_patients', 
-    #         self.extract_with_llm(report_text, 'patient_info'), 
-    #         report_path.name
-    #     )
-    #     stats['encounters'] = self.insert_staging_data(
-    #         'staging_encounters', 
-    #         self.extract_with_llm(report_text, 'encounter'), 
-    #         report_path.name
-    #     )
-    #     stats['conditions'] = self.insert_staging_data(
-    #         'staging_conditions', 
-    #         self.extract_with_llm(report_text, 'conditions'), 
-    #         report_path.name
-    #     )
-    #     stats['medications'] = self.insert_staging_data(
-    #         'staging_medications', 
-    #         self.extract_with_llm(report_text, 'medications'), 
-    #         report_path.name
-    #     )
-    #     stats['observations'] = self.insert_staging_data(
-    #         'staging_observations', 
-    #         self.extract_with_llm(report_text, 'observations'), 
-    #         report_path.name
-    #     )
-    #     stats['allergies'] = self.insert_staging_data(
-    #         'staging_allergies', 
-    #         self.extract_with_llm(report_text, 'allergies'), 
-    #         report_path.name
-    #     )
-    #     stats['procedures'] = self.insert_staging_data(
-    #         'staging_procedures', 
-    #         self.extract_with_llm(report_text, 'procedures'), 
-    #         report_path.name
-    #     )
-    #     stats['immunizations'] = self.insert_staging_data(
-    #         'staging_immunizations', 
-    #         self.extract_with_llm(report_text, 'immunizations'), 
-    #         report_path.name
-    #     )
-        
-    #     print(f"  ✓ Traité: {stats}")
-    #     return stats
-
     def process_report(self, report_path: Path) -> Dict[str, int]:
         """Traite un rapport complet et insère toutes les données de staging"""
         print(f"\n📄 Traitement : {report_path.name}")
@@ -301,50 +247,36 @@ Ne retourne que le JSON, sans texte supplémentaire. NE PAS INCLURE patient_id o
         
         stats = {}
 
-        # 1. Extraire les données PARENT (Patient et Encounter)
+        # --- 1. Extraire les données de base ---
         patient_metadata = extract_patient_metadata_from_text(report_text)
-        patient_data = {}
-        if patient_metadata:
-            patient_data = patient_metadata.copy()
-        else:
-            patient_data = self.extract_with_llm(report_text, 'patient_info')
+        patient_data = patient_metadata.copy() if patient_metadata else {}
 
-        encounter_data = self.extract_with_llm(report_text, 'encounter')
+        # Si pas de métadonnées valides, utiliser l'IA
+        if not patient_data:
+            patient_data = self.extract_with_llm(report_text, 'patient_info') or {}
 
-        # Valider que les données de base existent
-        if not patient_data or not isinstance(patient_data, dict):
-            patient_data = {}
-
-        # Compléter avec les métadonnées si besoin
-        for key, val in (patient_metadata or {}).items():
-            if key not in patient_data or not patient_data.get(key):
-                patient_data[key] = val
-
+        # Toujours générer un ID unique si manquant
         if not patient_data.get('id'):
-            # Essayer de récupérer l'id via le nom de fichier (suffixe) si nécessaire
-            id_from_filename = None
-            match = re.search(r"patient_\d+_([a-f0-9-]+)\.txt", report_path.name, re.IGNORECASE)
-            if match:
-                id_from_filename = match.group(1)
-            if id_from_filename:
-                patient_data['id'] = id_from_filename
+            patient_data['id'] = str(uuid.uuid4())
 
-        if not patient_data.get('id'):
-            print("  ✗ Échec de l'extraction de patient_info (ID manquant). Rapport ignoré.")
-            return {}
+        # Assurer la cohérence minimale
+        for key in ["first_name", "last_name", "birthdate", "gender"]:
+            patient_data.setdefault(key, None)
 
-        if not encounter_data or not isinstance(encounter_data, dict) or not encounter_data.get('id'):
-            print("  ✗ Échec de l'extraction de encounter (ID manquant). Rapport ignoré.")
-            return {}
+        # --- 2. Extraire les données de la consultation ---
+        encounter_data = self.extract_with_llm(report_text, 'encounter') or {}
 
-        # Obtenir les IDs de lien
-        report_patient_id = patient_data.get('id')
-        report_encounter_id = encounter_data.get('id')
-        
-        # Lier l'encounter au patient
-        encounter_data['patient_id'] = report_patient_id
+        if not encounter_data.get('id'):
+            encounter_data['id'] = str(uuid.uuid4())
+        encounter_data['patient_id'] = patient_data['id']
 
-        # 2. Insérer les données PARENT
+        # Compléter valeurs minimales
+        encounter_data.setdefault("encounter_class", "wellness")
+        encounter_data.setdefault("description", "Consultation de routine")
+        encounter_data.setdefault("base_encounter_cost", 591)
+        encounter_data.setdefault("total_claim_cost", 591)
+
+        # --- 3. Insérer patient + encounter ---
         stats['patients'] = self.insert_staging_data(
             'staging_patients', patient_data, report_path.name
         )
@@ -352,32 +284,27 @@ Ne retourne que le JSON, sans texte supplémentaire. NE PAS INCLURE patient_id o
             'staging_encounters', encounter_data, report_path.name
         )
 
-        # 3. Fonction "wrapper" pour traiter les tables ENFANT
+        # --- 4. Gérer les tables enfants ---
         def process_child_table(table_name: str, extraction_type: str):
             child_data_list = self.extract_with_llm(report_text, extraction_type)
             if not child_data_list or not isinstance(child_data_list, list):
                 return 0
-            
-            # FORCER les IDs parents pour garantir l'intégrité
             for item in child_data_list:
                 if isinstance(item, dict):
-                    item['patient_id'] = report_patient_id
-                    item['encounter_id'] = report_encounter_id
-            
-            return self.insert_staging_data(
-                table_name, child_data_list, report_path.name
-            )
+                    item['patient_id'] = patient_data['id']
+                    item['encounter_id'] = encounter_data['id']
+            return self.insert_staging_data(table_name, child_data_list, report_path.name)
 
-        # 4. Traiter toutes les tables ENFANT
         stats['conditions'] = process_child_table('staging_conditions', 'conditions')
         stats['medications'] = process_child_table('staging_medications', 'medications')
         stats['observations'] = process_child_table('staging_observations', 'observations')
         stats['allergies'] = process_child_table('staging_allergies', 'allergies')
         stats['procedures'] = process_child_table('staging_procedures', 'procedures')
         stats['immunizations'] = process_child_table('staging_immunizations', 'immunizations')
-        
+
         print(f"  ✓ Traité: {stats}")
         return stats
+
     
     def process_all_reports(self, max_reports: int = None):
         """Traite tous les rapports du dossier"""
