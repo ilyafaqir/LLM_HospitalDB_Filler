@@ -9,10 +9,36 @@ import re
 import json
 import mysql.connector
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 from groq import Groq
 from dotenv import load_dotenv
 import uuid
+
+# Imports pour la lecture de différents formats de fichiers
+PDF_LIB = None
+PDF_AVAILABLE = False
+try:
+    import PyPDF2
+    PDF_LIB = PyPDF2
+    PDF_AVAILABLE = True
+except ImportError:
+    try:
+        import pypdf
+        PDF_LIB = pypdf
+        PDF_AVAILABLE = True
+    except ImportError:
+        PDF_AVAILABLE = False
+        print("⚠️  Attention: PyPDF2/pypdf non installé. Support PDF désactivé.")
+
+DOCX_AVAILABLE = False
+DOCX_Document = None
+try:
+    from docx import Document
+    DOCX_Document = Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    print("⚠️  Attention: python-docx non installé. Support DOCX désactivé.")
 
 # --- Configuration Globale ---
 load_dotenv()
@@ -25,8 +51,65 @@ DB_CONFIG = {
     'charset': 'utf8mb4'
 }
 # Utiliser les rapports générés par structure_to_pdf_text.py
-# Ils se trouvent dans: moroccan_unstructured_data/txt
-REPORTS_FOLDER = Path("moroccan_unstructured_data") / "txt"
+# Support multiple formats: txt, pdf, docx
+REPORTS_FOLDER = Path("moroccan_unstructured_data")
+SUPPORTED_EXTENSIONS = ['.txt', '.pdf', '.docx', '.doc']
+
+
+def extract_text_from_pdf(file_path: Path) -> Optional[str]:
+    """Extrait le texte d'un fichier PDF"""
+    if not PDF_AVAILABLE or PDF_LIB is None:
+        print(f"  ⚠️  Support PDF non disponible. Installez PyPDF2: pip install PyPDF2")
+        return None
+    
+    try:
+        text_parts = []
+        with open(file_path, 'rb') as file:
+            pdf_reader = PDF_LIB.PdfReader(file)
+            for page in pdf_reader.pages:
+                text_parts.append(page.extract_text())
+        
+        return '\n'.join(text_parts)
+    except Exception as e:
+        print(f"  ❌ Erreur lors de l'extraction PDF: {e}")
+        return None
+
+
+def extract_text_from_docx(file_path: Path) -> Optional[str]:
+    """Extrait le texte d'un fichier DOCX"""
+    if not DOCX_AVAILABLE or DOCX_Document is None:
+        print(f"  ⚠️  Support DOCX non disponible. Installez python-docx: pip install python-docx")
+        return None
+    
+    try:
+        doc = DOCX_Document(file_path)
+        text_parts = []
+        for paragraph in doc.paragraphs:
+            text_parts.append(paragraph.text)
+        return '\n'.join(text_parts)
+    except Exception as e:
+        print(f"  ❌ Erreur lors de l'extraction DOCX: {e}")
+        return None
+
+
+def extract_text_from_file(file_path: Path) -> Optional[str]:
+    """Extrait le texte d'un fichier selon son extension"""
+    extension = file_path.suffix.lower()
+    
+    if extension == '.txt':
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e:
+            print(f"  ❌ Erreur lors de la lecture TXT: {e}")
+            return None
+    elif extension == '.pdf':
+        return extract_text_from_pdf(file_path)
+    elif extension in ['.docx', '.doc']:
+        return extract_text_from_docx(file_path)
+    else:
+        print(f"  ⚠️  Format non supporté: {extension}")
+        return None
 
 
 def extract_patient_metadata_from_text(report_text: str) -> Dict:
@@ -123,6 +206,7 @@ class StagingExtractor:
             exit()
             
         print(f"✓ Dossier des rapports : {self.reports_folder}")
+        print(f"✓ Formats supportés : {', '.join(SUPPORTED_EXTENSIONS)}")
     
     def extract_with_llm(self, report_text: str, extraction_type: str) -> Dict:
         """Utilise Groq AI pour extraire les données structurées du rapport"""
@@ -493,12 +577,16 @@ Ne retourne que le JSON, sans texte supplémentaire. NE PAS INCLURE patient_id o
 
     def process_report(self, report_path: Path) -> Dict[str, int]:
         """Traite un rapport complet : extraction → validation → insertion immédiate"""
-        print(f"\n📄 Traitement : {report_path.name}")
-        try:
-            with open(report_path, 'r', encoding='utf-8') as f:
-                report_text = f.read()
-        except Exception as e:
-            print(f"  ✗ Impossible de lire le fichier: {e}")
+        print(f"\n📄 Traitement : {report_path.name} ({report_path.suffix})")
+        
+        # Extraire le texte selon le format du fichier
+        report_text = extract_text_from_file(report_path)
+        if not report_text:
+            print(f"  ✗ Impossible d'extraire le texte du fichier")
+            return {}
+        
+        if len(report_text.strip()) == 0:
+            print(f"  ⚠️  Fichier vide ou aucun texte extrait")
             return {}
         
         stats = {}
@@ -608,16 +696,36 @@ Ne retourne que le JSON, sans texte supplémentaire. NE PAS INCLURE patient_id o
 
     
     def process_all_reports(self, max_reports: int = None):
-        """Traite tous les rapports du dossier"""
-        # Recherche récursive de tous les .txt
-        report_files = list(self.reports_folder.rglob("*.txt"))
+        """Traite tous les rapports du dossier (txt, pdf, docx)"""
+        # Recherche récursive de tous les fichiers supportés
+        report_files = []
+        for ext in SUPPORTED_EXTENSIONS:
+            found_files = list(self.reports_folder.rglob(f"*{ext}"))
+            report_files.extend(found_files)
+        
         if not report_files:
-            print(f"✗ Aucun fichier .txt trouvé dans : {self.reports_folder.resolve()}")
+            print(f"✗ Aucun fichier supporté trouvé dans : {self.reports_folder.resolve()}")
+            print(f"   Formats recherchés: {', '.join(SUPPORTED_EXTENSIONS)}")
             return
+        
+        # Trier par nom pour un traitement ordonné
+        report_files.sort(key=lambda x: x.name)
+        
         if max_reports: 
             report_files = report_files[:max_reports]
         
+        # Statistiques par format
+        format_stats = {}
+        for file in report_files:
+            ext = file.suffix.lower()
+            format_stats[ext] = format_stats.get(ext, 0) + 1
+        
         print(f"\n{'='*70}\nTRAITEMENT DE {len(report_files)} RAPPORTS VERS STAGING\n{'='*70}")
+        print(f"📊 Répartition par format:")
+        for ext, count in sorted(format_stats.items()):
+            print(f"   {ext}: {count} fichier(s)")
+        print(f"{'='*70}")
+        
         for idx, report_path in enumerate(report_files, 1):
             print(f"\n[{idx}/{len(report_files)}]")
             try:
